@@ -1,0 +1,6 @@
+{
+  "name": "Persona Replica Engine",
+  "description": "An AI Persona Replica Studio that analyzes writing samples, chat logs, and tweets to clone behavior, speech patterns, and mindset into interactive digital replicas.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
