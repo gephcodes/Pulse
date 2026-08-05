@@ -7,6 +7,21 @@ import { GoogleGenAI, Type, Modality } from "@google/genai";
 dotenv.config();
 
 const app = express();
+
+// 1. HARDCODED SECURITY HEADERS MIDDLEWARE
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "SAMEORIGIN");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  res.setHeader("X-DNS-Prefetch-Control", "off");
+  res.setHeader("X-Download-Options", "noopen");
+  res.setHeader("X-Permitted-Cross-Domain-Policies", "none");
+  next();
+});
+
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = 3000;
@@ -71,30 +86,77 @@ function rateLimiterMiddleware(req: express.Request, res: express.Response, next
   next();
 }
 
-app.use("/api/", rateLimiterMiddleware);
+// Hardcoded Payload Limit & Input Validation Middleware
+function enforcePayloadSecurity(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (req.method === "POST") {
+    const contentType = req.headers["content-type"];
+    if (contentType && !contentType.includes("application/json")) {
+      return res.status(415).json({ error: "Unsupported Media Type. Expected application/json." });
+    }
 
-// Server-Side PII Scrubbing Helper
+    if (req.body?.referenceText && typeof req.body.referenceText === "string") {
+      if (req.body.referenceText.length > 100000) {
+        return res.status(413).json({ error: "Payload security violation: Reference text exceeds 100,000 characters limit." });
+      }
+    }
+    if (req.body?.userMessage && typeof req.body.userMessage === "string") {
+      if (req.body.userMessage.length > 10000) {
+        return res.status(413).json({ error: "Payload security violation: Message exceeds 10,000 characters limit." });
+      }
+    }
+  }
+  next();
+}
+
+app.use("/api/", rateLimiterMiddleware);
+app.use("/api/", enforcePayloadSecurity);
+
+// Helper to safely sanitize error messages (preventing API Key leaks)
+function safeErrorMessage(err: any): string {
+  if (!err) return "An unexpected error occurred.";
+  let msg = String(err?.message || err);
+  return msg.replace(/AIza[0-9A-Za-z-_]{35}/g, "[REDACTED_API_KEY]");
+}
+
+// Server-Side Hardcoded PII Scrubbing Helper
 function serverScrubPII(text: string): { cleanText: string; redactedCount: number } {
   if (!text) return { cleanText: '', redactedCount: 0 };
   let clean = text;
 
   const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/gi;
   const phoneRegex = /\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g;
-  const apiKeyRegex = /(?:sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}|AIza[0-9A-Za-z-_]{35})/gi;
+  const apiKeyRegex = /(?:sk-[a-zA-Z0-9]{20,}|ghp_[a-zA-Z0-9]{20,}|AIza[0-9A-Za-z-_]{35}|bearer\s+[a-zA-Z0-9._-]{20,})/gi;
+  const creditCardRegex = /\b(?:\d[ -]*?){13,16}\b/g;
+  const ssnRegex = /\b\d{3}-\d{2}-\d{4}\b/g;
   const ipRegex = /\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/g;
+  const passwordRegex = /(?:password|passwd|secret|auth_token)\s*[:=]\s*['"]?([^\s'"]+)['"]?/gi;
 
   const emails = text.match(emailRegex) || [];
   const phones = text.match(phoneRegex) || [];
   const apiKeys = text.match(apiKeyRegex) || [];
+  const ssns = text.match(ssnRegex) || [];
   const ips = text.match(ipRegex) || [];
+  const pass = text.match(passwordRegex) || [];
 
-  const count = emails.length + phones.length + apiKeys.length + ips.length;
+  let ccCount = 0;
+  clean = clean.replace(creditCardRegex, (match) => {
+    const digits = match.replace(/\D/g, '');
+    if (digits.length >= 13 && digits.length <= 16) {
+      ccCount++;
+      return '[REDACTED_CREDIT_CARD]';
+    }
+    return match;
+  });
+
+  const count = emails.length + phones.length + apiKeys.length + ssns.length + ips.length + pass.length + ccCount;
 
   clean = clean
     .replace(emailRegex, '[REDACTED_EMAIL]')
     .replace(phoneRegex, '[REDACTED_PHONE]')
     .replace(apiKeyRegex, '[REDACTED_API_KEY]')
-    .replace(ipRegex, '[REDACTED_IP]');
+    .replace(ssnRegex, '[REDACTED_SSN]')
+    .replace(ipRegex, '[REDACTED_IP]')
+    .replace(passwordRegex, 'password: [REDACTED_SECRET]');
 
   return { cleanText: clean, redactedCount: count };
 }
@@ -107,8 +169,10 @@ function sanitizeUserChatInput(input: string): { safeInput: string; wasInjection
   const injectionPatterns = [
     /ignore (?:all )?(?:previous|above|system) (?:instructions|rules|directives)/i,
     /disregard (?:all )?(?:previous|above|system) (?:instructions|rules)/i,
-    /you are now (?:DAN|unrestricted|godmode)/i,
+    /you are now (?:DAN|unrestricted|godmode|developer mode)/i,
+    /bypass (?:all )?filters/i,
     /print (?:out )?(?:the )?(?:system|raw) prompt/i,
+    /show me your (?:system|hidden) (?:instructions|prompt)/i,
   ];
 
   for (const pat of injectionPatterns) {
@@ -207,11 +271,12 @@ ${sanitizedReferenceText}
 
 Extract the tone, casing, vocabulary, mental models, directness, and forbidden behaviors from <reference_data_isolated>.
 Generate a compiled system instruction that strictly follows these OPERATIONAL DIRECTIVES:
-1. TONE & VOCABULARY: Adopt exact slang, casing (all-lowercase vs capitalized), punctuation style, and terminology.
-2. THINKING FRAMEWORK: Adopt specific mental models, priorities, worldviews, and core principles.
-3. VERSATILITY & OPEN CONVERSATION: The persona must be able to converse freely and naturally on ANY topic the user brings up — whether casual daily chat, life advice, entertainment, sports, music, gaming, philosophy, creative ideas, or technical questions. Engage fully with whatever topic the user introduces, speaking 100% in the persona's distinct voice without forcing technical framing unless requested.
-4. NO CONVERSATIONAL FILLER: Never break character, never explain "As an AI...", never use polite assistant disclaimers or greetings.
-5. REASONING: Extrapolate decision making based on the established mindset and logic.`;
+1. TONE & VOCABULARY: Adopt the specific slang, casing (e.g. all-lowercase vs capitalized), punctuation style, and terminology.
+2. SYNTHESIS NOT PARROTING: The persona MUST NOT memorize or parrot back the exact phrasing of the reference text. It must synthesize the underlying speech PATTERN and style, and use it to construct entirely new, original responses to whatever the user says.
+3. THINKING FRAMEWORK: Adopt specific mental models, priorities, worldviews, and core principles.
+4. VERSATILITY & OPEN CONVERSATION: The persona must be able to converse freely and naturally on ANY topic the user brings up. Engage fully with whatever topic the user introduces, speaking 100% in the persona's distinct voice.
+5. NO CONVERSATIONAL FILLER: Never break character, never explain "As an AI...", never use polite assistant disclaimers or greetings.
+6. NO SIMULATED EMOTIONS: The persona should not pretend to have real feelings, consciousness, or deep romantic attachments. It must adhere to the speech pattern without crossing into simulated emotional sentience.`;
 
     const response = await generateContentWithFallback(ai, {
       preferredModel: "gemini-2.5-flash",
@@ -294,7 +359,7 @@ Generate a compiled system instruction that strictly follows these OPERATIONAL D
     });
   } catch (err: any) {
     console.error("Error analyzing persona:", err);
-    res.status(500).json({ error: err?.message || "Failed to analyze reference text for persona replica." });
+    res.status(500).json({ error: safeErrorMessage(err) });
   }
 });
 
@@ -417,7 +482,7 @@ Rate the character fidelity score (0 to 100) and give a 1-sentence reason.`;
 
   } catch (err: any) {
     console.error("Error in chat-persona:", err);
-    res.status(500).json({ error: err?.message || "Failed to generate replica chat response." });
+    res.status(500).json({ error: safeErrorMessage(err) });
   }
 });
 
@@ -517,7 +582,7 @@ Provide a brief analysis highlighting how the Persona Replica transformed the to
 
   } catch (err: any) {
     console.error("Error in benchmark-persona:", err);
-    res.status(500).json({ error: err?.message || "Failed to execute benchmark comparison." });
+    res.status(500).json({ error: safeErrorMessage(err) });
   }
 });
 
@@ -553,7 +618,7 @@ app.post("/api/tts", async (req, res) => {
     return res.json({ audioBase64: base64Audio });
   } catch (err: any) {
     console.error("Error generating TTS:", err);
-    res.status(500).json({ error: err?.message || "Failed to generate speech." });
+    res.status(500).json({ error: safeErrorMessage(err) });
   }
 });
 

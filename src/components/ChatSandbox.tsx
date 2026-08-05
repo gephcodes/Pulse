@@ -116,10 +116,10 @@ const ChatInput = memo(({
 
   const handleSubmit = useCallback(() => {
     const trimmed = input.trim();
-    if (!trimmed || isLoading) return;
+    if (!trimmed) return;
     onSend(trimmed);
     setInput('');
-  }, [input, isLoading, onSend]);
+  }, [input, onSend]);
 
   return (
     <div className="p-4 bg-slate-950/80 border-t border-slate-800/80 flex items-center gap-2">
@@ -134,7 +134,7 @@ const ChatInput = memo(({
 
       <button
         onClick={handleSubmit}
-        disabled={!input.trim() || isLoading}
+        disabled={!input.trim()}
         className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white p-2.5 rounded-xl shadow-md shadow-indigo-600/30 transition-all cursor-pointer"
       >
         <Send className="h-4 w-4" />
@@ -302,10 +302,10 @@ export const ChatSandbox: React.FC<ChatSandboxProps> = memo(({ activePersona, on
         });
         return updated;
       });
-    } catch (e) {
+    } catch (e: any) {
       console.error('Failed to generate reply', e);
       const errorMsgId = (Date.now() + 1).toString();
-      const errorText = 'Failed to generate response. Please check API connection.';
+      const errorText = e.message || 'Failed to generate response. Please check API connection.';
       const encError = await encryptMessageText(errorText);
 
       const errorMsg: ChatMessage = {
